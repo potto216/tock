@@ -8,6 +8,7 @@
 use capsules_core::i2c_master::I2CMasterDriver;
 use capsules_core::virtualizers::virtual_alarm::MuxAlarm;
 use capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm;
+use capsules_core::virtualizers::virtual_uart::MuxUart;
 use capsules_extra::usb::cdc::CdcAcm;
 use enum_primitive::cast::FromPrimitive;
 use kernel::capabilities;
@@ -66,11 +67,21 @@ type TemperatureDriver = components::temperature::TemperatureComponentType<Tempe
 
 pub type SchedulerInUse = components::sched::round_robin::RoundRobinComponentType;
 
+/// Board-specific driver number for the second serial interface.
+///
+/// This driver uses the same syscall ABI as the console capsule. The standard
+/// console driver number is reserved for the selected console output, while
+/// this number exposes the other serial transport for application-controlled
+/// communication.
+pub const GENERAL_UART_DRIVER_NUM: usize = 0x20004;
+
 /// Base drivers for the Raspberry Pi Pico boards
 pub struct Platform {
     pub systick: cortexm0p::systick::SysTick,
     pub ipc: kernel::ipc::IPC<{ NUM_PROCS as u8 }>,
     pub scheduler: &'static SchedulerInUse,
+    pub uart_mux: &'static MuxUart<'static>,
+    pub general_uart_mux: &'static MuxUart<'static>,
     alarm: &'static capsules_core::alarm::AlarmDriver<
         'static,
         VirtualMuxAlarm<'static, rp2040::timer::RPTimer<'static>>,
@@ -82,6 +93,7 @@ pub struct Platform {
     date_time:
         &'static capsules_extra::date_time::DateTimeCapsule<'static, rp2040::rtc::Rtc<'static>>,
     console: &'static capsules_core::console::Console<'static>,
+    general_uart: &'static capsules_core::console::Console<'static>,
 }
 
 impl SyscallDriverLookup for Platform {
@@ -91,6 +103,7 @@ impl SyscallDriverLookup for Platform {
     {
         match driver_num {
             capsules_core::console::DRIVER_NUM => f(Some(self.console)),
+            GENERAL_UART_DRIVER_NUM => f(Some(self.general_uart)),
             capsules_core::alarm::DRIVER_NUM => f(Some(self.alarm)),
             capsules_core::gpio::DRIVER_NUM => f(Some(self.gpio)),
             kernel::ipc::DRIVER_NUM => f(Some(&self.ipc)),
@@ -217,7 +230,11 @@ pub unsafe fn cdc_setup(
     ))
 }
 
-/// Use either CDC or UART as output
+/// Use either CDC or UART as the kernel console/debug/process-console output.
+///
+/// The transport not selected here is exposed to userspace as
+/// [`GENERAL_UART_DRIVER_NUM`].
+#[derive(Clone, Copy)]
 pub enum Output {
     Cdc,
     Uart,
@@ -327,42 +344,18 @@ pub unsafe fn setup(
     )
     .finalize(components::alarm_component_static!(RPTimer));
 
-    let uart_mux = match output {
-        Output::Cdc => {
-            let strings = static_init!(
-                [&str; 3],
-                [
-                    "Raspberry Pi",      // Manufacturer
-                    "Pico - TockOS",     // Product
-                    "00000000000000000", // Serial number
-                ]
-            );
+    let cdc = cdc_setup(peripherals, mux_alarm);
+    cdc.enable();
+    cdc.attach();
 
-            let cdc = components::cdc::CdcAcmComponent::new(
-                &peripherals.usb,
-                //capsules_extra::usb::cdc::MAX_CTRL_PACKET_SIZE_RP2040,
-                64,
-                peripherals.sysinfo.get_manufacturer_rp2040(),
-                peripherals.sysinfo.get_part(),
-                strings,
-                mux_alarm,
-                None,
-            )
-            .finalize(components::cdc_acm_component_static!(
-                rp2040::usb::UsbCtrl,
-                rp2040::timer::RPTimer
-            ));
+    let cdc_mux = components::console::UartMuxComponent::new(cdc, 115200)
+        .finalize(components::uart_mux_component_static!());
+    let uart0_mux = components::console::UartMuxComponent::new(&peripherals.uart0, 115200)
+        .finalize(components::uart_mux_component_static!());
 
-            cdc.enable();
-            cdc.attach();
-
-            // UART
-            // Create a shared UART channel for kernel debug.
-            components::console::UartMuxComponent::new(cdc, 115200)
-                .finalize(components::uart_mux_component_static!())
-        }
-        Output::Uart => components::console::UartMuxComponent::new(&peripherals.uart0, 115200)
-            .finalize(components::uart_mux_component_static!()),
+    let (uart_mux, general_uart_mux) = match output {
+        Output::Cdc => (cdc_mux, uart0_mux),
+        Output::Uart => (uart0_mux, cdc_mux),
     };
 
     // Setup the console.
@@ -372,6 +365,14 @@ pub unsafe fn setup(
         uart_mux,
     )
     .finalize(components::console_component_static!());
+
+    let general_uart = components::console::ConsoleComponent::new(
+        board_kernel,
+        GENERAL_UART_DRIVER_NUM,
+        general_uart_mux,
+    )
+    .finalize(components::console_component_static!());
+
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new_unsafe(
         uart_mux,
@@ -550,12 +551,15 @@ pub unsafe fn setup(
 
     let platform = Platform {
         console,
+        general_uart,
         alarm,
         gpio,
         adc,
         temperature,
         i2c,
         date_time,
+        uart_mux,
+        general_uart_mux,
         systick: cortexm0p::systick::SysTick::new_with_calibration(125_000_000),
         ipc: kernel::ipc::IPC::new(
             board_kernel,
